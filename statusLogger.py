@@ -1,18 +1,14 @@
 import asyncio
 import aiohttp
-import fastapi
 import feedparser
-import os
 import re
 import html
 from datetime import datetime
 from typing import Optional, List
-import fastapi
-import uvicorn
 
 
 # ==========================================
-# Feed Client (Handles HTTP + ETag caching)
+# Feed Client
 # ==========================================
 
 class FeedClient:
@@ -30,8 +26,6 @@ class FeedClient:
             headers["If-Modified-Since"] = self.last_modified
 
         async with session.get(self.feed_url, headers=headers) as response:
-            print(f"[DEBUG] HTTP Status: {response.status}")
-
             if response.status == 304:
                 return None
 
@@ -57,24 +51,21 @@ class FeedParser:
     def parse(self, raw_feed: str) -> List[dict]:
         events = []
         feed = feedparser.parse(raw_feed)
-        new_count = 0
 
         for entry in feed.entries:
             entry_id = getattr(entry, "id", getattr(entry, "link", None))
             if not entry_id:
                 continue
 
-            # First run → print everything
+            # First run → print all
             if not self.initialized:
                 self.seen_entries.add(entry_id)
 
-            # After first run → only unseen
+            # After first run → only new
             elif entry_id in self.seen_entries:
                 continue
             else:
                 self.seen_entries.add(entry_id)
-
-            new_count += 1
 
             timestamp = self._extract_timestamp(entry)
             raw_html = getattr(entry, "summary", "")
@@ -85,17 +76,12 @@ class FeedParser:
             product = f"OpenAI API - {components}"
 
             events.append({
-                "timestamp": timestamp,
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                 "product": product,
                 "status": status_message
             })
 
-        if not self.initialized:
-            print("[DEBUG] First run - printed all existing entries")
-            self.initialized = True
-        else:
-            print(f"[DEBUG] New events detected: {new_count}")
-
+        self.initialized = True
         return events
 
     def _extract_timestamp(self, entry):
@@ -107,9 +93,7 @@ class FeedParser:
 
     def _extract_components(self, raw_html: str) -> str:
         components = re.findall(r"<li>(.*?)\s*\(", raw_html)
-        if components:
-            return ", ".join(components)
-        return "General"
+        return ", ".join(components) if components else "General"
 
     def _extract_status_message(self, raw_html: str) -> str:
         text = html.unescape(raw_html)
@@ -117,15 +101,12 @@ class FeedParser:
         text = re.split(r"Affected components", text, flags=re.IGNORECASE)[0]
         text = text.replace("Status:", "").strip()
         text = re.sub(r"\s+", " ", text)
-
-        # Remove boilerplate recovery text
         text = re.split(r"All impacted services", text, flags=re.IGNORECASE)[0]
-
         return text.strip()
 
 
 # ==========================================
-# Monitor (Orchestrator)
+# Monitor Service
 # ==========================================
 
 class StatusMonitor:
@@ -134,15 +115,15 @@ class StatusMonitor:
         self.clients = {url: FeedClient(url) for url in feed_urls}
         self.parser = FeedParser()
         self.semaphore = asyncio.Semaphore(concurrency_limit)
+        self.latest_events: List[str] = []
 
     async def _fetch_one(self, url: str, session: aiohttp.ClientSession):
         async with self.semaphore:
             return await self.clients[url].fetch(session)
 
-    async def start(self, interval: int = 60):
+    async def start(self, interval: int = 10):
         async with aiohttp.ClientSession() as session:
             while True:
-
                 try:
                     tasks = [
                         self._fetch_one(url, session)
@@ -163,43 +144,13 @@ class StatusMonitor:
                 await asyncio.sleep(interval)
 
     def _log(self, event: dict):
-        print(f"[{event['timestamp']}] Product: {event['product']}")
-        print(f"Status: {event['status']}\n")
+        formatted = (
+            f"[{event['timestamp']}] "
+            f"Product: {event['product']}\n"
+            f"Status: {event['status']}"
+        )
 
+        print(formatted + "\n")
 
-# ==========================================
-# FastAPI App (Render Web Service)
-# ==========================================
-
-app = fastapi.FastAPI()
-
-PROVIDERS = [
-    "https://status.openai.com/history.atom"
-]
-
-monitor = StatusMonitor(PROVIDERS, concurrency_limit=20)
-
-
-@app.on_event("startup")
-async def startup_event():
-    # Run monitor in background
-    asyncio.create_task(monitor.start(interval=10))
-
-
-@app.get("/")
-async def root():
-    return {"message": "OpenAI Status Monitor is running"}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-
-# ==========================================
-# Entry Point
-# ==========================================
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        self.latest_events.insert(0, formatted)
+        self.latest_events = self.latest_events[:50]

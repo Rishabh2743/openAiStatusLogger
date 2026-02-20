@@ -1,10 +1,14 @@
 import asyncio
 import aiohttp
+import fastapi
 import feedparser
+import os
 import re
 import html
 from datetime import datetime
 from typing import Optional, List
+import fastapi
+import uvicorn
 
 
 # ==========================================
@@ -164,13 +168,38 @@ class StatusMonitor:
 
 
 # ==========================================
+# FastAPI App (Render Web Service)
+# ==========================================
+
+app = fastapi.FastAPI()
+
+PROVIDERS = [
+    "https://status.openai.com/history.atom"
+]
+
+monitor = StatusMonitor(PROVIDERS, concurrency_limit=20)
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Run monitor in background
+    asyncio.create_task(monitor.start(interval=10))
+
+
+@app.get("/")
+async def root():
+    return {"message": "OpenAI Status Monitor is running"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
+# ==========================================
 # Entry Point
 # ==========================================
 
 if __name__ == "__main__":
-    PROVIDERS = [
-        "https://status.openai.com/history.atom"
-    ]
-
-    monitor = StatusMonitor(PROVIDERS, concurrency_limit=20)
-    asyncio.run(monitor.start(interval=10))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

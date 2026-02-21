@@ -5,10 +5,11 @@ import re
 import html
 from datetime import datetime
 from typing import Optional, List
-
+import os
+import fastapi
 
 # ==========================================
-# Feed Client
+# Feed Client (Single Responsibility)
 # ==========================================
 
 class FeedClient:
@@ -33,6 +34,7 @@ class FeedClient:
 
             content = await response.text()
 
+            # Update cache headers
             self.etag = response.headers.get("ETag")
             self.last_modified = response.headers.get("Last-Modified")
 
@@ -40,15 +42,14 @@ class FeedClient:
 
 
 # ==========================================
-# Feed Parser
+# Feed Parser (Single Responsibility)
 # ==========================================
 
 class FeedParser:
     def __init__(self):
         self.seen_entries = set()
-        self.initialized = False
 
-    def parse(self, raw_feed: str) -> List[dict]:
+    def parse(self, raw_feed: str, first_run: bool) -> List[dict]:
         events = []
         feed = feedparser.parse(raw_feed)
 
@@ -57,15 +58,11 @@ class FeedParser:
             if not entry_id:
                 continue
 
-            # First run → print all
-            if not self.initialized:
-                self.seen_entries.add(entry_id)
-
-            # After first run → only new
-            elif entry_id in self.seen_entries:
+            # After first run → skip already seen
+            if not first_run and entry_id in self.seen_entries:
                 continue
-            else:
-                self.seen_entries.add(entry_id)
+
+            self.seen_entries.add(entry_id)
 
             timestamp = self._extract_timestamp(entry)
             raw_html = getattr(entry, "summary", "")
@@ -73,15 +70,19 @@ class FeedParser:
             components = self._extract_components(raw_html)
             status_message = self._extract_status_message(raw_html)
 
-            product = f"OpenAI API - {components}"
-
             events.append({
-                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                "product": product,
+                "timestamp": timestamp,  # store as datetime first
+                "product": f"OpenAI API - {components}",
                 "status": status_message
             })
 
-        self.initialized = True
+        # Sort newest first
+        events.sort(key=lambda x: x["timestamp"], reverse=False)
+
+        # Convert timestamp to string format before returning
+        for event in events:
+            event["timestamp"] = event["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+
         return events
 
     def _extract_timestamp(self, entry):
@@ -104,46 +105,40 @@ class FeedParser:
         text = re.split(r"All impacted services", text, flags=re.IGNORECASE)[0]
         return text.strip()
 
-
 # ==========================================
-# Monitor Service
+# Status Monitor (Orchestrator)
 # ==========================================
 
 class StatusMonitor:
-    def __init__(self, feed_urls: List[str], concurrency_limit: int = 20):
+    def __init__(self, feed_urls: List[str], interval: int = 10):
         self.feed_urls = feed_urls
         self.clients = {url: FeedClient(url) for url in feed_urls}
         self.parser = FeedParser()
-        self.semaphore = asyncio.Semaphore(concurrency_limit)
+        self.interval = interval
         self.latest_events: List[str] = []
+        self._first_run = True
 
-    async def _fetch_one(self, url: str, session: aiohttp.ClientSession):
-        async with self.semaphore:
-            return await self.clients[url].fetch(session)
-
-    async def start(self, interval: int = 10):
+    async def start(self):
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    tasks = [
-                        self._fetch_one(url, session)
-                        for url in self.feed_urls
-                    ]
+                    for url in self.feed_urls:
+                        raw_feed = await self.clients[url].fetch(session)
 
-                    raw_results = await asyncio.gather(*tasks)
-
-                    for raw_feed in raw_results:
                         if raw_feed:
-                            events = self.parser.parse(raw_feed)
+                            events = self.parser.parse(raw_feed, self._first_run)
+
                             for event in events:
-                                self._log(event)
+                                self._add_event(event)
+
+                            self._first_run = False
 
                 except Exception as e:
                     print("[ERROR]:", e)
 
-                await asyncio.sleep(interval)
+                await asyncio.sleep(self.interval)
 
-    def _log(self, event: dict):
+    def _add_event(self, event: dict):
         formatted = (
             f"[{event['timestamp']}] "
             f"Product: {event['product']}\n"
@@ -152,5 +147,8 @@ class StatusMonitor:
 
         print(formatted + "\n")
 
+        # Insert at top
         self.latest_events.insert(0, formatted)
+
+        # Keep only last 50
         self.latest_events = self.latest_events[:50]
